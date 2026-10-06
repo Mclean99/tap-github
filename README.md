@@ -1,184 +1,34 @@
-# tap-github
+"""Test suite for tap-github."""
 
-`tap-github` is a Singer tap for GitHub.
+import requests
+import requests_cache
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-Built with the [Singer SDK](https://gitlab.com/meltano/singer-sdk).
+requests_cache.install_cache(
+    ".cache/api_calls_tests_cache",
+    backend="sqlite",
+    ignored_parameters=["Authorization", "User-Agent", "If-modified-since"],
+    match_headers=True,
+    expire_after=24 * 60 * 60,
+    allowable_methods=["GET", "POST"],
+)
 
-## Installation
+_retry_strategy = Retry(
+    total=3,
+    status_forcelist=[403, 429],
+    backoff_factor=2,
+    respect_retry_after_header=True,
+)
+_retry_adapter = HTTPAdapter(max_retries=_retry_strategy)
 
-```bash
-# use uv (https://docs.astral.sh/uv/)
-uv tool install meltanolabs-tap-github
+_original_session_init = requests.Session.__init__
 
-# or pipx (https://pipx.pypa.io/stable/)
-pipx install meltanolabs-tap-github
 
-# or Meltano
-meltano add extractor tap-github
-```
+def _session_init_with_retries(self, *args, **kwargs):
+    _original_session_init(self, *args, **kwargs)
+    self.mount("https://", _retry_adapter)
+    self.mount("http://", _retry_adapter)
 
-A list of release versions is available at https://github.com/MeltanoLabs/tap-github/releases
 
-## Configuration
-
-### Accepted Config Options
-
-This tap accepts the following configuration options:
-
-- Required: One and only one of the following modes:
-  1. `repositories`: An array of strings specifying the GitHub repositories to be included. Each element of the array should be of the form `<org>/<repository>`, e.g. `MeltanoLabs/tap-github`.
-  1. `organizations`: An array of strings containing the github organizations to be included
-  1. `searches`: An array of search descriptor objects with the following properties:
-     - `name`: A human readable name for the search query
-     - `query`: A github search string (generally the same as would come after `?q=` in the URL)
-  1. `user_usernames`: A list of github usernames
-  1. `user_ids`: A list of github user ids [int]
-- Highly recommended:
-  - Personal access tokens (PATs) for authentication can be provided in 3 ways:
-    - `auth_token` - Takes a single token.
-    - `additional_auth_tokens` - Takes a list of tokens. Can be used together with `auth_token` or as the sole source of PATs.
-    - Any environment variables beginning with `GITHUB_TOKEN` will be assumed to be PATs. These tokens will be used in addition to `auth_token` (if provided), but will not be used if `additional_auth_tokens` is provided.
-  - GitHub App keys are another option for authentication, and can be used in combination with PATs if desired. App IDs and keys should be assembled into the format `:app_id:;;-----BEGIN RSA PRIVATE KEY-----\n_YOUR_P_KEY_\n-----END RSA PRIVATE KEY-----` (replace `:app_id:` with your actual GitHub App ID and `_YOUR_P_KEY_` with your private key content) where the key can be generated from the `Private keys` section on https://github.com/organizations/:organization_name/settings/apps/:app_name. Read more about GitHub App quotas [here](https://docs.github.com/en/enterprise-server@3.3/developers/apps/building-github-apps/rate-limits-for-github-apps#server-to-server-requests). Formatted app keys can be provided in 3 ways:
-    - `auth_app_keys` - List of GitHub App keys in the prescribed format. These keys are organization-agnostic and will be used as fallback for all organizations.
-    - `org_auth_app_keys` - Object/dictionary mapping organization names to lists of GitHub App keys. This allows you to specify different app credentials for different organizations, enabling better rate limit management across multiple organizations. Example:
-      ```yaml
-      auth_app_keys:
-        - "fallback_app_id;;-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
-      org_auth_app_keys:
-        my-org:
-          - "app_id_1;;-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
-          - "app_id_2;;-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
-        another-org:
-          - "app_id_3;;-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
-      ```
-    - If `auth_app_keys` is not provided but there is an environment variable with the name `GITHUB_APP_PRIVATE_KEY`, it will be assumed to be an App key in the prescribed format (organization-agnostic).
-- Optional:
-  - `user_agent`
-  - `start_date`
-  - `metrics_log_level`
-  - `stream_maps`
-  - `stream_maps_config`
-  - `stream_options`: Options which can change the behaviour of a specific stream are nested within.
-    - `milestones`: Valid options for the `milestones` stream are nested within.
-      - `state`: Determines which milestones will be extracted. One of `open` (default), `closed`, `all`.
-    - `project_items`: Valid options for the `project_items` stream are nested within.
-      - `page_size`: Number of ProjectV2 items to request per GraphQL page. Defaults to `100`, GitHub's maximum. Lower values can reduce GraphQL query complexity for projects with many custom fields at the cost of more requests.
-  - `rate_limit_buffer`: A buffer to avoid consuming all query points for the auth_token at hand. Defaults to 1000.
-  - `expiry_time_buffer`: A buffer used when determining when to refresh GitHub app tokens. Only relevant when authenticating as a GitHub app. Defaults to 10 minutes. Tokens generated by GitHub apps expire 1 hour after creation, and will be refreshed once fewer than `expiry_time_buffer` minutes remain until the anticipated expiry time.
-  - `backoff_max_tries`: The maximum number of backoff retry attempts for failed API requests that are retriable. Defaults to 5.
-
-Note that modes 1-3 are `repository` modes and 4-5 are `user` modes and will not run the same set of streams.
-
-A full list of supported settings and capabilities for this tap is available by running:
-
-```bash
-tap-github --about
-```
-
-### Source Authentication and Authorization
-
-A small number of records may be pulled without an auth token. However, a Github auth token should generally be considered "required" since it gives more realistic rate limits. (See GitHub API docs for more info.)
-
-#### Multi-Organization Authentication
-
-When using `org_auth_app_keys`, the tap will automatically switch authentication contexts based on the organization being processed. This enables:
-
-- **Organization-specific rate limits**: Each organization can have its own set of GitHub App credentials, preventing rate limit exhaustion when processing multiple organizations.
-- **Automatic token selection**: When processing repositories from a specific organization, the tap will prefer tokens configured for that organization.
-- **Fallback behavior**: If no organization-specific tokens are available, the tap will fall back to:
-  1. Organization-agnostic tokens (personal tokens or `auth_app_keys`)
-  1. Tokens from other organizations (for accessing public data)
-
-## Usage
-
-### API Limitation - Pagination
-
-The GitHub API is limited for some resources such as `/events`. For some resources, users might encounter the following error:
-
-```
-In order to keep the API fast for everyone, pagination is limited for this resource. Check the rel=last link relation in the Link response header to see how far back you can traverse.
-```
-
-To avoid this, the GitHub streams will exit early. I.e. when there are no more `next page` available. If you are fecthing `/events` at the repository level, beware of letting the tap disabled for longer than a few days or you will have gaps in your data.
-
-You can easily run `tap-github` by itself or in a pipeline using [Meltano](www.meltano.com).
-
-### Notes regarding permissions
-
-- For the `traffic_*` streams, [you will need write access to the repository](https://docs.github.com/en/rest/metrics/traffic?apiVersion=2022-11-28). You can enable extraction for these streams by [selecting them in the catalog](https://hub.meltano.com/singer/spec/#metadata).
-
-### Executing the Tap Directly
-
-```bash
-tap-github --version
-tap-github --help
-tap-github --config CONFIG --discover > ./catalog.json
-```
-
-## Contributing
-
-This project uses parent-child streams. Learn more about them [here.](https://gitlab.com/meltano/sdk/-/blob/main/docs/parent_streams.md)
-
-### Initialize your Development Environment
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh  # https://docs.astral.sh/uv/getting-started/installation/
-uv sync
-```
-
-### Create and Run Tests
-
-Create tests within the `tap_github/tests` subfolder and
-then run:
-
-```bash
-uv run pytest
-```
-
-You can also test the `tap-github` CLI interface directly using `uv run`:
-
-```bash
-uv run tap-github --help
-```
-
-### Testing with [Meltano](meltano.com)
-
-_**Note:** This tap will work in any Singer environment and does not require Meltano.
-Examples here are for convenience and to streamline end-to-end orchestration scenarios._
-
-Your project comes with a custom `meltano.yml` project file already created. Open the `meltano.yml` and follow any _"TODO"_ items listed in
-the file.
-
-Next, install Meltano (if you haven't already) and any needed plugins:
-
-```bash
-# Install meltano
-uv tool install meltano
-# Initialize meltano within this directory
-cd tap-github
-meltano install
-```
-
-Now you can test and orchestrate using Meltano:
-
-```bash
-# Test invocation:
-meltano invoke tap-github --version
-# OR run a pipeline:
-meltano run tap-github target-jsonl
-```
-
-One-liner to recreate output directory, run elt, and write out state file:
-
-```bash
-# Update this when you want a fresh state file:
-TESTJOB=testjob1
-
-# Run everything in one line
-mkdir -p .output && meltano elt tap-github target-jsonl --job_id $TESTJOB && meltano elt tap-github target-jsonl --job_id $TESTJOB --dump=state > .output/state.json
-```
-
-### Singer SDK Dev Guide
-
-See the [dev guide](../../docs/dev_guide.md) for more instructions on how to use the Singer SDK to
-develop your own taps and targets.
+requests.Session.__init__ = _session_init_with_retries
